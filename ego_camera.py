@@ -2,6 +2,7 @@ import carla
 import numpy as np
 import cv2
 import queue
+import random
 from global_planner import get_forward_centerline, visualize_path
 from frenet_math import get_frenet
 
@@ -45,6 +46,40 @@ def main():
     vehicle = world.spawn_actor(bp, spawn_point)
     vehicle.set_autopilot(True, tm_port)
     print("Ego vehicle spawned!")
+
+    # --- 2. SPAWN BACKGROUND TRAFFIC ---
+    print("Spawning 50 background traffic vehicles...")
+    
+    # Get all vehicle blueprints and filter for only 4-wheeled vehicles (no bikes)
+    blueprints_vehicles = blueprint_library.filter('vehicle.*')
+    blueprints_vehicles = [x for x in blueprints_vehicles if int(x.get_attribute('number_of_wheels')) == 4]
+    
+    # Remove the ego vehicle's spawn point so we don't spawn a car on top of ourselves
+    spawn_points.remove(spawn_point)
+    random.shuffle(spawn_points)
+    
+    # Define CARLA batch commands for efficiency
+    SpawnActor = carla.command.SpawnActor
+    SetAutopilot = carla.command.SetAutopilot
+    FutureActor = carla.command.FutureActor
+    
+    batch = []
+    npc_vehicles_list = [] # Keep track of them so we can delete them later
+    
+    # Ask CARLA to spawn 50 cars at random locations
+    for n, transform in enumerate(spawn_points[:50]):
+        bp = random.choice(blueprints_vehicles)
+        # Spawn the car and immediately hand it over to the Traffic Manager
+        batch.append(SpawnActor(bp, transform).then(SetAutopilot(FutureActor, True, tm_port)))
+        
+    # Send the batch to the server
+    responses = client.apply_batch_sync(batch, True)
+    
+    for response in responses:
+        if not response.error:
+            npc_vehicles_list.append(response.actor_id)
+            
+    print(f"Successfully spawned {len(npc_vehicles_list)} traffic vehicles.")
 
     # Spawn Semantic Camera
     cam_bp = blueprint_library.find('sensor.camera.semantic_segmentation')
