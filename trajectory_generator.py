@@ -79,7 +79,7 @@ def generate_frenet_paths(current_d, current_v, current_a):
 # print("0done")
 
 # Quick test to make sure our math works before we plug it into CARLA!
-    print("Testing Quintic Trajectory Generator...")
+print("Testing Quintic Trajectory Generator...")
 # Assume we are in the center lane (d=0), going straight, and want to evaluate options
 bundle = generate_frenet_paths(current_d=0.0, current_v=40.0, current_a=0.0)
 
