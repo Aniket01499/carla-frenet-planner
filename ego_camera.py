@@ -1,19 +1,24 @@
 """
 ego_camera.py
 
-Single entry point. Spawns background traffic, an ego vehicle (autopilot --
-driving accuracy is out of scope, see conversation notes), the 5-sensor
-suite defined in sensor_config.py via SensorManager, and runs the existing
-Frenet-frame trajectory planner alongside it for visualization (shadow-only:
-it draws the chosen path, it doesn't drive the car -- that's a separate
-follow-up).
+Single entry point. Traffic Manager autopilot handles navigation (route
+choice, when to slow/turn/stop) exactly as it would for any CARLA vehicle
+-- that's not the point of this project. What IS the point: instead of
+letting CARLA's PhysX execute the throttle/steer/brake that autopilot
+computes, we intercept it and run it through vehicle_dynamics.py (the
+thesis's Fiala-tire bicycle model) each tick, then push the result back
+into CARLA via set_transform(). CARLA is now used purely for navigation
+decisions, rendering, and sensors -- not vehicle physics.
 
-Every ~1 second, logs a one-line-per-sensor diagnostic (point/detection
-counts and ranges) instead of the old per-tick trajectory print spam.
+The existing Frenet planner still runs and draws its chosen path as
+debug dots each tick (uses ground-truth NPC positions, not a perception
+model) -- it's a visualization/portfolio piece now, not connected to
+vehicle control.
 
 Run with the CARLA server already running. Press 'q' in any sensor window
-to stop. Requires sensor_manager.py, sensor_config.py, and
-sensor_visualization.py in the same folder.
+to stop. Requires sensor_manager.py, sensor_config.py,
+sensor_visualization.py, calibration.py, and vehicle_dynamics.py in the
+same folder.
 """
 
 from __future__ import annotations
@@ -39,12 +44,12 @@ from sensor_visualization import (
     fused_bev,
 )
 from calibration import lidar_to_vehicle_frame, radar_to_vehicle_frame
-
-SPEC_BY_NAME = {spec.name: spec for spec in SENSOR_SPECS}
+from vehicle_dynamics import step as dynamics_step, VehicleParams, BicycleState
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+SPEC_BY_NAME = {spec.name: spec for spec in SENSOR_SPECS}
 DIAGNOSTIC_INTERVAL_TICKS = 20  # ~1 second at fixed_delta_seconds=0.05
 
 
@@ -71,8 +76,28 @@ def spawn_background_traffic(client, world, blueprint_library, spawn_points, cou
     return npc_ids
 
 
-def run_planning_step(world, vehicle, cost_evaluator):
-    """One tick of the shadow planner: compute + visualize the best path only."""
+def get_ground_truth_obstacles(world, ego_vehicle, map_x, map_y, map_s):
+    """Ground-truth NPC positions (not a perception model), projected to Frenet."""
+    obstacles = []
+    for actor in world.get_actors().filter("vehicle.*"):
+        if actor.id == ego_vehicle.id:
+            continue
+        loc = actor.get_location()
+        yaw = math.radians(actor.get_transform().rotation.yaw)
+        try:
+            s, d = get_frenet(loc.x, loc.y, yaw, map_x, map_y, map_s)
+        except (IndexError, ZeroDivisionError):
+            continue
+        obstacles.append({"s": s, "d": d})
+    return obstacles
+
+
+def visualize_shadow_plan(world, vehicle, cost_evaluator):
+    """
+    Portfolio piece, not connected to vehicle control: runs the Frenet
+    planner against ground-truth obstacles and draws the chosen path.
+    Doesn't drive the car -- Traffic Manager + vehicle_dynamics.py do that.
+    """
     map_x, map_y, map_s = get_forward_centerline(vehicle, world.get_map())
     visualize_path(world, map_x, map_y)
 
@@ -88,11 +113,11 @@ def run_planning_step(world, vehicle, cost_evaluator):
     c_s, c_d = get_frenet(loc.x, loc.y, yaw, map_x, map_y, map_s)
     bundles = generate_frenet_paths(c_s=c_s, c_s_v=speed, c_s_a=0.0,
                                      c_d=c_d, c_d_v=0.0, c_d_a=0.0)
+    obstacles = get_ground_truth_obstacles(world, vehicle, map_x, map_y, map_s)
 
     best_path, lowest_cost = None, float("inf")
-    obstacles = []  # ground-truth obstacle wiring is a follow-up step
     for path in bundles:
-        cost = cost_evaluator.calculate_total_cost(path, obstacles, target_speed=20.0)
+        cost = cost_evaluator.calculate_total_cost(path, obstacles, target_speed=15.0)
         if cost < lowest_cost:
             lowest_cost, best_path = cost, path
 
@@ -104,6 +129,20 @@ def run_planning_step(world, vehicle, cost_evaluator):
                 carla.Location(x=p_x, y=p_y, z=loc.z + 0.5),
                 size=0.1, color=carla.Color(255, 0, 0), life_time=0.1,
             )
+
+
+def autopilot_control_to_dynamics_input(vehicle, max_steer_rad):
+    """
+    Reads whatever throttle/steer/brake Traffic Manager just computed for
+    this vehicle -- apply_control() sets that state regardless of whether
+    physics is enabled to act on it -- and converts it into the throttle
+    (single signed value) / steering (radians) convention
+    vehicle_dynamics.step() expects.
+    """
+    control = vehicle.get_control()
+    throttle = -control.brake if control.brake > 0.0 else control.throttle
+    steering = control.steer * max_steer_rad
+    return throttle, steering, control
 
 
 def main() -> None:
@@ -121,19 +160,35 @@ def main() -> None:
 
     blueprint_library = world.get_blueprint_library()
 
-    # Ego vehicle
+    # Ego vehicle: autopilot handles navigation, our model handles physics.
     vehicle_bp = blueprint_library.filter("model3")[0]
     spawn_points = world.get_map().get_spawn_points()
     spawn_point = spawn_points[10] if len(spawn_points) > 10 else spawn_points[0]
     vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-    vehicle.set_autopilot(True, tm.get_port())
-    logger.info("Ego vehicle spawned!")
 
-    # Background traffic
+    # Grab the vehicle's real max steering angle before disabling physics --
+    # control.steer is normalized [-1, 1], not radians, and this converts it.
+    physics_control = vehicle.get_physics_control()
+    front_wheels = physics_control.wheels[:2]
+    max_steer_rad = math.radians(sum(w.max_steer_angle for w in front_wheels) / len(front_wheels))
+    logger.info(f"Vehicle max steer angle: {math.degrees(max_steer_rad):.1f} deg")
+
+    vehicle.set_autopilot(True, tm.get_port())
+    vehicle.set_simulate_physics(False)
+    logger.info("Autopilot ON for navigation. Physics OFF -- vehicle_dynamics.py executes it.")
+
+    spawn_z = spawn_point.location.z
+    dyn_state = BicycleState(
+        X=spawn_point.location.x,
+        Y=spawn_point.location.y,
+        psi=math.radians(spawn_point.rotation.yaw),
+        v=0.0, r=0.0, beta=0.0,
+    )
+    dyn_params = VehicleParams()
+
     remaining_spawn_points = [p for p in spawn_points if p != spawn_point]
     npc_ids = spawn_background_traffic(client, world, blueprint_library, remaining_spawn_points)
 
-    # Sensors
     manager = SensorManager(world, vehicle, SENSOR_SPECS, output_root="runs")
     manager.spawn_all()
 
@@ -159,12 +214,29 @@ def main() -> None:
                 readings["front_radar"], SPEC_BY_NAME["front_radar"].transform)
             cv2.imshow("Fused BEV", fused_bev(lidar_vehicle, radar_vehicle))
 
-            run_planning_step(world, vehicle, cost_evaluator)
+            visualize_shadow_plan(world, vehicle, cost_evaluator)
+
+            throttle, steering, raw_control = autopilot_control_to_dynamics_input(vehicle, max_steer_rad)
+            dyn_state = dynamics_step(dyn_state, throttle, steering, settings.fixed_delta_seconds, dyn_params)
+
+            vehicle.set_transform(carla.Transform(
+                carla.Location(x=dyn_state.X, y=dyn_state.Y, z=spawn_z),
+                carla.Rotation(yaw=math.degrees(dyn_state.psi)),
+            ))
+            vehicle.set_target_velocity(carla.Vector3D(
+                dyn_state.v * math.cos(dyn_state.psi + dyn_state.beta),
+                dyn_state.v * math.sin(dyn_state.psi + dyn_state.beta),
+                0.0,
+            ))
 
             tick_count += 1
             if tick_count % DIAGNOSTIC_INTERVAL_TICKS == 0:
                 for name, line in summarize_frame(readings).items():
                     logger.info(f"[{name}] {line}")
+                logger.info(f"[autopilot_control] throttle={raw_control.throttle:.2f} "
+                            f"steer={raw_control.steer:.2f} brake={raw_control.brake:.2f}")
+                logger.info(f"[ego_dynamics] v={dyn_state.v:.2f}m/s "
+                            f"steering={math.degrees(steering):.1f}deg beta={math.degrees(dyn_state.beta):.2f}deg")
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
