@@ -1,127 +1,187 @@
-import carla
-import numpy as np
-import cv2
-import queue
+"""
+ego_camera.py
+
+Single entry point. Spawns background traffic, an ego vehicle (autopilot --
+driving accuracy is out of scope, see conversation notes), the 5-sensor
+suite defined in sensor_config.py via SensorManager, and runs the existing
+Frenet-frame trajectory planner alongside it for visualization (shadow-only:
+it draws the chosen path, it doesn't drive the car -- that's a separate
+follow-up).
+
+Every ~1 second, logs a one-line-per-sensor diagnostic (point/detection
+counts and ranges) instead of the old per-tick trajectory print spam.
+
+Run with the CARLA server already running. Press 'q' in any sensor window
+to stop. Requires sensor_manager.py, sensor_config.py, and
+sensor_visualization.py in the same folder.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
 import random
+
+import carla
+import cv2
+
 from global_planner import get_forward_centerline, visualize_path
-from frenet_math import get_frenet
+from frenet_math import get_frenet, get_cartesian
+from trajectory_generator import generate_frenet_paths
+from cost_function import CostEvaluator
+from sensor_manager import SensorManager, summarize_frame
+from sensor_config import SENSOR_SPECS
+from sensor_visualization import (
+    rgb_to_bgr_array,
+    semantic_to_bgr_array,
+    lidar_to_bev,
+    radar_to_bev,
+    fused_bev,
+)
+from calibration import lidar_to_vehicle_frame, radar_to_vehicle_frame
 
-def process_img(image):
-    i = np.array(image.raw_data)
-    i2 = i.reshape((image.height, image.width, 4))
-    tags = i2[:, :, 2]
-    
-    perception_view = np.zeros((image.height, image.width, 3), dtype=np.uint8)
-    perception_view[tags == 7] = (128, 64, 128)  # Roads (Purple)
-    perception_view[tags == 10] = (255, 0, 0)    # Vehicles (Blue)
-    perception_view[tags == 4] = (0, 0, 255)     # Pedestrians (Red)
-    perception_view[tags == 1] = (70, 70, 70)    # Buildings (Dark Gray)
-    
-    cv2.imshow("Semantic Perception", perception_view)
-    cv2.waitKey(1)
+SPEC_BY_NAME = {spec.name: spec for spec in SENSOR_SPECS}
 
-def main():
-    client = carla.Client('localhost', 2000)
-    client.set_timeout(5.0)
-    world = client.get_world()
-    
-    # --- 1. ENABLE SYNCHRONOUS MODE ---
-    settings = world.get_settings()
-    settings.synchronous_mode = True
-    settings.fixed_delta_seconds = 0.05  # Force exactly 20 FPS (Perfect for MPC math)
-    world.apply_settings(settings)
+logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    blueprint_library = world.get_blueprint_library()
+DIAGNOSTIC_INTERVAL_TICKS = 20  # ~1 second at fixed_delta_seconds=0.05
 
-    # Set up Traffic Manager to sync with the server
-    tm = client.get_trafficmanager(8000)
-    tm_port = tm.get_port()
-    tm.set_synchronous_mode(True)
 
-    # Spawn Ego Vehicle
-    bp = blueprint_library.filter('model3')[0]
-    spawn_points = world.get_map().get_spawn_points()
-    spawn_point = spawn_points[10] if len(spawn_points) > 10 else spawn_points[0]
-    
-    vehicle = world.spawn_actor(bp, spawn_point)
-    vehicle.set_autopilot(True, tm_port)
-    print("Ego vehicle spawned!")
+def spawn_background_traffic(client, world, blueprint_library, spawn_points, count=50):
+    """Batch-spawn NPC traffic under Traffic Manager control. Returns actor ids."""
+    blueprints_vehicles = blueprint_library.filter("vehicle.*")
+    blueprints_vehicles = [x for x in blueprints_vehicles if int(x.get_attribute("number_of_wheels")) == 4]
 
-    # --- 2. SPAWN BACKGROUND TRAFFIC ---
-    print("Spawning 50 background traffic vehicles...")
-    
-    # Get all vehicle blueprints and filter for only 4-wheeled vehicles (no bikes)
-    blueprints_vehicles = blueprint_library.filter('vehicle.*')
-    blueprints_vehicles = [x for x in blueprints_vehicles if int(x.get_attribute('number_of_wheels')) == 4]
-    
-    # Remove the ego vehicle's spawn point so we don't spawn a car on top of ourselves
-    spawn_points.remove(spawn_point)
     random.shuffle(spawn_points)
-    
-    # Define CARLA batch commands for efficiency
+
     SpawnActor = carla.command.SpawnActor
     SetAutopilot = carla.command.SetAutopilot
     FutureActor = carla.command.FutureActor
-    
+
+    tm_port = client.get_trafficmanager(8000).get_port()
     batch = []
-    npc_vehicles_list = [] # Keep track of them so we can delete them later
-    
-    # Ask CARLA to spawn 50 cars at random locations
-    for n, transform in enumerate(spawn_points[:50]):
+    for transform in spawn_points[:count]:
         bp = random.choice(blueprints_vehicles)
-        # Spawn the car and immediately hand it over to the Traffic Manager
         batch.append(SpawnActor(bp, transform).then(SetAutopilot(FutureActor, True, tm_port)))
-        
-    # Send the batch to the server
+
     responses = client.apply_batch_sync(batch, True)
-    
-    for response in responses:
-        if not response.error:
-            npc_vehicles_list.append(response.actor_id)
-            
-    print(f"Successfully spawned {len(npc_vehicles_list)} traffic vehicles.")
+    npc_ids = [r.actor_id for r in responses if not r.error]
+    logger.info(f"Successfully spawned {len(npc_ids)} traffic vehicles.")
+    return npc_ids
 
-    # Spawn Semantic Camera
-    cam_bp = blueprint_library.find('sensor.camera.semantic_segmentation')
-    cam_bp.set_attribute('image_size_x', '640')
-    cam_bp.set_attribute('image_size_y', '360')
-    cam_bp.set_attribute('fov', '90')
-    
-    spawn_point_cam = carla.Transform(carla.Location(x=1.5, z=1.4))
-    camera = world.spawn_actor(cam_bp, spawn_point_cam, attach_to=vehicle)
 
-    image_queue = queue.Queue()
-    camera.listen(image_queue.put)
+def run_planning_step(world, vehicle, cost_evaluator):
+    """One tick of the shadow planner: compute + visualize the best path only."""
+    map_x, map_y, map_s = get_forward_centerline(vehicle, world.get_map())
+    visualize_path(world, map_x, map_y)
 
+    if len(map_s) < 2:
+        return
+
+    transform = vehicle.get_transform()
+    loc = transform.location
+    yaw = math.radians(transform.rotation.yaw)
+    vel = vehicle.get_velocity()
+    speed = math.sqrt(vel.x ** 2 + vel.y ** 2)
+
+    c_s, c_d = get_frenet(loc.x, loc.y, yaw, map_x, map_y, map_s)
+    bundles = generate_frenet_paths(c_s=c_s, c_s_v=speed, c_s_a=0.0,
+                                     c_d=c_d, c_d_v=0.0, c_d_a=0.0)
+
+    best_path, lowest_cost = None, float("inf")
+    obstacles = []  # ground-truth obstacle wiring is a follow-up step
+    for path in bundles:
+        cost = cost_evaluator.calculate_total_cost(path, obstacles, target_speed=20.0)
+        if cost < lowest_cost:
+            lowest_cost, best_path = cost, path
+
+    if best_path:
+        for i in range(0, len(best_path["s_points"]), 3):
+            s, d = best_path["s_points"][i], best_path["d_points"][i]
+            p_x, p_y = get_cartesian(s, d, map_x, map_y, map_s)
+            world.debug.draw_point(
+                carla.Location(x=p_x, y=p_y, z=loc.z + 0.5),
+                size=0.1, color=carla.Color(255, 0, 0), life_time=0.1,
+            )
+
+
+def main() -> None:
+    client = carla.Client("localhost", 2000)
+    client.set_timeout(30.0)
+    world = client.get_world()
+
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = 0.05
+    world.apply_settings(settings)
+
+    tm = client.get_trafficmanager(8000)
+    tm.set_synchronous_mode(True)
+
+    blueprint_library = world.get_blueprint_library()
+
+    # Ego vehicle
+    vehicle_bp = blueprint_library.filter("model3")[0]
+    spawn_points = world.get_map().get_spawn_points()
+    spawn_point = spawn_points[10] if len(spawn_points) > 10 else spawn_points[0]
+    vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+    vehicle.set_autopilot(True, tm.get_port())
+    logger.info("Ego vehicle spawned!")
+
+    # Background traffic
+    remaining_spawn_points = [p for p in spawn_points if p != spawn_point]
+    npc_ids = spawn_background_traffic(client, world, blueprint_library, remaining_spawn_points)
+
+    # Sensors
+    manager = SensorManager(world, vehicle, SENSOR_SPECS, output_root="runs")
+    manager.spawn_all()
+
+    cost_evaluator = CostEvaluator()
+
+    logger.info("Streaming in SYNCHRONOUS MODE. Press 'q' in a sensor window to stop.")
+    tick_count = 0
     try:
-        print("Streaming in SYNCHRONOUS MODE... Press Ctrl+C in terminal to stop.")
         while True:
-            # 1. Tell the server to compute exactly ONE frame of physics
             world.tick()
-            
-            # 2. Extract the HD Map Centerline (100 meters ahead)
-            map_x, map_y, map_s = get_forward_centerline(vehicle, world.get_map())
-            
-            # 3. Draw the invisible centerline in the simulator so we can see it!
-            visualize_path(world, map_x, map_y)
-            
-            # 4. Process Semantic Camera (for obstacles)
-            image = image_queue.get()
-            process_img(image)
+            frame_id = world.get_snapshot().frame
+            readings = manager.get_synced_frame(frame_id, timeout=2.0)
+
+            cv2.imshow("Left Blind Spot", rgb_to_bgr_array(readings["left_blind_spot_rgb"]))
+            cv2.imshow("Right Blind Spot", rgb_to_bgr_array(readings["right_blind_spot_rgb"]))
+            cv2.imshow("Center Semantic", semantic_to_bgr_array(readings["center_semantic"]))
+            cv2.imshow("Lidar BEV", lidar_to_bev(readings["roof_lidar"]))
+            cv2.imshow("Radar BEV", radar_to_bev(readings["front_radar"]))
+
+            lidar_vehicle = lidar_to_vehicle_frame(
+                readings["roof_lidar"], SPEC_BY_NAME["roof_lidar"].transform)
+            radar_vehicle = radar_to_vehicle_frame(
+                readings["front_radar"], SPEC_BY_NAME["front_radar"].transform)
+            cv2.imshow("Fused BEV", fused_bev(lidar_vehicle, radar_vehicle))
+
+            run_planning_step(world, vehicle, cost_evaluator)
+
+            tick_count += 1
+            if tick_count % DIAGNOSTIC_INTERVAL_TICKS == 0:
+                for name, line in summarize_frame(readings).items():
+                    logger.info(f"[{name}] {line}")
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user...")
+        logger.info("Interrupted by user...")
     finally:
-        print("Restoring Asynchronous mode and destroying actors...")
-        # WE MUST TURN OFF SYNC MODE BEFORE EXITING, OR THE SERVER WILL FREEZE
-        settings = world.get_settings()
+        logger.info("Cleaning up...")
+        manager.destroy_all()
+        vehicle.destroy()
+        client.apply_batch([carla.command.DestroyActor(x) for x in npc_ids])
+        cv2.destroyAllWindows()
+
         settings.synchronous_mode = False
         settings.fixed_delta_seconds = None
         world.apply_settings(settings)
-        
-        camera.destroy()
-        vehicle.destroy()
-        cv2.destroyAllWindows()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

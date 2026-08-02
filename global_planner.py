@@ -23,10 +23,9 @@ def get_forward_centerline(vehicle, carla_map, distance=100, interval=1.0):
         
         # Ask CARLA for the next waypoint in the center of this specific lane
         next_wps = waypoint.next(interval)
-        
-        # If the road ends, stop extracting
-        if not next_wps:
-            break
+        if len(next_wps) > 1:
+            current_yaw = waypoint.transform.rotation.yaw
+            next_wps = sorted(next_wps, key=lambda wp: abs(wp.transform.rotation.yaw - current_yaw))
             
         waypoint = next_wps[0]
         current_s += interval
