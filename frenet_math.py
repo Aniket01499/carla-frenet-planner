@@ -62,3 +62,46 @@ def get_frenet(x, y, theta, map_x, map_y, map_s):
     s = map_s[prev_wp] + np.sqrt(proj_x**2 + proj_y**2)
     
     return s, d
+
+
+def get_cartesian(s, d, map_x, map_y, map_s):
+    """
+    Transforms Frenet (s, d) to Cartesian (x, y).
+    map_x, map_y: Arrays of the reference path coordinates.
+    map_s: Array of cumulative distances along the reference path.
+    """
+    # 1. Find the map segment that contains our target 's'
+    prev_wp = 0
+    # Loop through the map's cumulative 's' distances.
+    # Stop when the NEXT waypoint's 's' distance is strictly greater than our target 's'.
+    # This means our target 's' lies somewhere between prev_wp and prev_wp + 1.
+    while prev_wp < len(map_s) - 1 and map_s[prev_wp+1] < s:
+        prev_wp += 1
+        
+    # 2. Set the next waypoint index
+    next_wp = prev_wp + 1
+    # Edge case: If 's' extends beyond our known map_s array bounds,
+    # clamp the indices to the very last segment of the map to avoid an IndexError.
+    if next_wp >= len(map_s):
+        next_wp = len(map_s) - 1
+        prev_wp = next_wp - 1
+        
+    # Road vector
+    n_x = map_x[next_wp] - map_x[prev_wp]
+    n_y = map_y[next_wp] - map_y[prev_wp]
+    
+    # Heading of the road
+    heading = np.arctan2(n_y, n_x)
+    
+    # Interpolate the reference (s=0) Cartesian coordinates
+    seg_s = map_s[next_wp] - map_s[prev_wp]
+    
+    ratio = (s - map_s[prev_wp]) / seg_s if seg_s != 0 else 0
+    x_ref = map_x[prev_wp] + ratio * n_x
+    y_ref = map_y[prev_wp] + ratio * n_y
+        
+    # Add the lateral (d) offset perpendicularly
+    x = x_ref - d * np.sin(heading)
+    y = y_ref + d * np.cos(heading)
+    
+    return x, y
